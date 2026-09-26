@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The XORA host is served with a self-signed certificate on the tailnet, so
+  system trust anchors cannot validate it. Rather than disable TLS globally, we
+  pin trust to exactly that one user certificate, supplied at build time.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system"/>
+            <certificates src="@raw/xora_tailnet_cert"/>
+        </trust-anchors>
+    </base-config>
+</network-security-config>
