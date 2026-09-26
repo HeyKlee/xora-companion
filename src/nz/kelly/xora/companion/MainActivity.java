@@ -40,6 +40,15 @@ import java.util.concurrent.Executors;
  */
 public class MainActivity extends Activity {
 
+    /**
+     * The LIVE XORA server, not the preview. 9105 serves var/app.db, which is
+     * where real accounts and real paired devices live; 9106 serves
+     * var/preview/app.db, where the phone has no enrolment, so a default of
+     * 9106 makes every device token come back 401 "invalid or revoked".
+     * 9105 is TLS on the tailnet cert this app already pins.
+     */
+    private static final String DEFAULT_HOST = "100.64.0.1:9105";
+
     private static final String PREFS = "xora_companion";
     private static final String KEY_HOST = "host";
     private static final String KEY_TOKEN = "device_token";
@@ -70,6 +79,7 @@ public class MainActivity extends Activity {
     private IconButton claimBtn;
     private IconButton releaseBtn;
     private IconButton logBtn;
+    private IconButton hostBtn;
 
     private XoraClient client;
     private MediaRecorder recorder;
@@ -82,7 +92,7 @@ public class MainActivity extends Activity {
         buildUi();
 
         SharedPreferences p = getSharedPreferences(PREFS, Context.MODE_PRIVATE);
-        hostInput.setText(p.getString(KEY_HOST, "100.64.0.1:9106"));
+        hostInput.setText(p.getString(KEY_HOST, DEFAULT_HOST));
         if (p.getString(KEY_TOKEN, null) != null) {
             // Paired: show the dashboard straight away.
             enterDashboard(p);
@@ -150,7 +160,7 @@ public class MainActivity extends Activity {
         hostInput = new EditText(this);
         hostInput.setTextColor(Color.parseColor("#e6f0ff"));
         hostInput.setHintTextColor(Color.parseColor("#5b6b7d"));
-        hostInput.setHint("100.64.0.1:9106");
+        hostInput.setHint(DEFAULT_HOST);
         hostInput.setSingleLine(true);
         pairCard.addView(hostInput);
 
@@ -200,6 +210,16 @@ public class MainActivity extends Activity {
         row3.addView(logBtn, cell());
         dash.addView(row3);
 
+        // Quaternary row: escape hatch. Without this the app is a dead end when
+        // it is pointed at the wrong host, because the pairing card is hidden
+        // whenever a token exists and there is no way back to it.
+        LinearLayout row4 = new LinearLayout(this);
+        row4.setGravity(Gravity.CENTER);
+        hostBtn = icon(IconButton.Glyph.CLOSE, "Change host or unpair", 24);
+        hostBtn.setOnClickListener(v -> changeHostOrUnpair());
+        row4.addView(hostBtn, cell());
+        dash.addView(row4);
+
         LinearLayout.LayoutParams dashLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
         dashLp.topMargin = dp(20);
@@ -238,6 +258,25 @@ public class MainActivity extends Activity {
         dash.setVisibility(paired ? View.VISIBLE : View.GONE);
     }
 
+    /**
+     * Drop the stored enrolment and return to the pairing card.
+     *
+     * The host is intentionally KEPT so the user can correct a wrong port
+     * without retyping it; only the token and device id are cleared, because
+     * those are what make the app look "paired" while every call 401s.
+     */
+    private void changeHostOrUnpair() {
+        stopPolling();
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .remove(KEY_TOKEN)
+                .remove(KEY_DEVICE_ID)
+                .remove(KEY_CURSOR)
+                .apply();
+        client = null;
+        setToast("Unpaired. Check the host, then pair again.");
+        showPairing();
+    }
+
     private void showPairing() {
         setPaired(false);
         orb.setState(OrbView.State.IDLE);
@@ -247,7 +286,7 @@ public class MainActivity extends Activity {
 
     private void enterDashboard(SharedPreferences p) {
         setPaired(true);
-        String base = XoraClient.baseUrl(p.getString(KEY_HOST, ""));
+        String base = XoraClient.baseUrl(p.getString(KEY_HOST, DEFAULT_HOST));
         client = new XoraClient(base, p.getString(KEY_TOKEN, null),
                 p.getString(KEY_DEVICE_ID, null), io);
         orb.setState(OrbView.State.PENDING);

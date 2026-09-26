@@ -55,15 +55,21 @@ final class XoraClient {
         return deviceId;
     }
 
+    /**
+     * The LIVE XORA server. 9106 is the isolated preview instance whose database
+     * has no enrolled devices, so pairing there yields a token that always 401s.
+     */
+    private static final String DEFAULT_PORT = "9105";
+
     static String baseUrl(String host) {
         String h = host == null ? "" : host.trim();
         if (h.isEmpty()) {
             return "";
         }
         if (h.startsWith("http://") || h.startsWith("https://")) {
-            return h.contains(":") ? h : h + ":9106";
+            return h.contains(":") ? h : h + ":" + DEFAULT_PORT;
         }
-        return h.contains(":") ? "https://" + h : "https://" + h + ":9106";
+        return h.contains(":") ? "https://" + h : "https://" + h + ":" + DEFAULT_PORT;
     }
 
     /** Trust the XORA tailnet cert specifically, not everything. */
