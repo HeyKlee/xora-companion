@@ -1,15 +1,20 @@
 package nz.kelly.xora.companion;
 
+import android.Manifest;
 import android.app.Activity;
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
+import android.graphics.drawable.GradientDrawable;
+import android.media.AudioRecord;
+import android.media.MediaRecorder;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
-import android.util.Base64;
 import android.view.Gravity;
 import android.view.View;
+import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
@@ -17,38 +22,21 @@ import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import org.json.JSONArray;
 import org.json.JSONObject;
 
-import java.io.BufferedReader;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.io.OutputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.nio.charset.StandardCharsets;
-import java.security.KeyStore;
-import java.security.cert.CertificateFactory;
-import java.security.cert.X509Certificate;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * XORA Companion - native Android pairing and continuity client.
+ * XORA Companion: the phone-side of the workspace.
  *
- * This is a real device app, not a WebView wrapper: it has its own UI, its own
- * pairing flow against the XORA device API, and its own credential storage. It
- * holds no session cookie and never handles the owner's password after pairing.
+ * Layout is orb-first. The Orb is the main focus and takes the top of the screen;
+ * controls are icon-only beneath it, because a phone has no room for titles.
+ * The dashboard only appears once the device is actually paired, so the user is
+ * never shown controls that would fail.
  *
- * Pairing follows the server contract in app/devices/router.py:
- *   POST /api/v1/devices/pairing-codes  -> { pairing_code, expires_in }
- *   POST /api/v1/devices/pair           -> { device: {...}, device_token }
- *
- * Only the SECOND call can be made by a native app. The mint endpoint sits
- * behind get_current_user plus a double-submit CSRF cookie, so it needs a
- * password session this app deliberately never has. The code is therefore
- * minted on the PC (Voice & Devices panel) and pasted here; this app only
- * redeems it, which is exactly what a bearer device credential is allowed to do.
+ * The audio handoff is a real protocol, not a label: claim, poll for a pending
+ * transfer, acknowledge it to take the lease, and release to give it back.
  */
 public class MainActivity extends Activity {
 
@@ -56,18 +44,37 @@ public class MainActivity extends Activity {
     private static final String KEY_HOST = "host";
     private static final String KEY_TOKEN = "device_token";
     private static final String KEY_DEVICE_ID = "device_id";
+    private static final String KEY_CURSOR = "transcript_cursor";
+    private static final int REQ_MIC = 7;
+    private static final long POLL_MS = 4000L;
 
     private final ExecutorService io = Executors.newSingleThreadExecutor();
     private final Handler main = new Handler(Looper.getMainLooper());
+    private Runnable poller;
 
+    private OrbView orb;
+    private TextView statusView;
+    private TextView leaseView;
+
+    // pairing surface
+    private LinearLayout pairCard;
     private EditText hostInput;
     private EditText codeInput;
-    private TextView statusView;
-    private TextView deviceView;
     private Button pairButton;
-    private Button syncButton;
-    private LinearLayout pairedSection;
-    private ScrollView scroll;
+
+    // dashboard surface
+    private LinearLayout dash;
+    private IconButton micBtn;
+    private IconButton handoffBtn;
+    private IconButton syncBtn;
+    private IconButton claimBtn;
+    private IconButton releaseBtn;
+    private IconButton logBtn;
+
+    private XoraClient client;
+    private MediaRecorder recorder;
+    private AudioRecord meter;
+    private volatile boolean micOn = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -75,331 +82,527 @@ public class MainActivity extends Activity {
         buildUi();
 
         SharedPreferences p = getSharedPreferences(PREFS, Context.MODE_PRIVATE);
-        String savedHost = p.getString(KEY_HOST, "100.64.0.1:9106");
-        hostInput.setText(savedHost);
+        hostInput.setText(p.getString(KEY_HOST, "100.64.0.1:9106"));
         if (p.getString(KEY_TOKEN, null) != null) {
-            deviceView.setText("Paired device: " + p.getString(KEY_DEVICE_ID, "?"));
-            setPaired(true);
-            refreshPresence();
+            // Paired: show the dashboard straight away.
+            enterDashboard(p);
         } else {
-            statusView.setText("Not paired. Enter the XORA host and tap Pair this device.");
+            showPairing();
         }
     }
 
+    // ---- layout ----------------------------------------------------------
+
+    private int dp(float v) {
+        return (int) (v * getResources().getDisplayMetrics().density);
+    }
+
+    private TextView label(String text, float sp, String colour) {
+        TextView t = new TextView(this);
+        t.setText(text);
+        t.setTextColor(Color.parseColor(colour));
+        t.setTextSize(sp);
+        return t;
+    }
+
     private void buildUi() {
-        scroll = new ScrollView(this);
+        ScrollView scroll = new ScrollView(this);
+        scroll.setBackgroundColor(Color.parseColor("#070b12"));
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(36, 44, 36, 44);
-        root.setBackgroundColor(Color.parseColor("#070b12"));
+        root.setGravity(Gravity.CENTER_HORIZONTAL);
+        root.setPadding(dp(20), dp(28), dp(20), dp(28));
         scroll.addView(root);
 
-        TextView title = new TextView(this);
-        title.setText("XORA Companion");
-        title.setTextColor(Color.parseColor("#61e8ff"));
-        title.setTextSize(26);
-        title.setGravity(Gravity.CENTER_HORIZONTAL);
+        // ---- the Orb is the main focus: top of screen, dominant size ----
+        orb = new OrbView(this);
+        orb.setContentDescription("XORA Orb. Tap to refresh connection.");
+        LinearLayout.LayoutParams orbLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(250));
+        root.addView(orb, orbLp);
+
+        orb.setOnClickListener(v -> refresh());
+
+        TextView title = label("XORA", 20, "#61e8ff");
+        title.setGravity(Gravity.CENTER);
         root.addView(title);
 
-        TextView sub = new TextView(this);
-        sub.setText("Native Android client for your XORA workspace");
-        sub.setTextColor(Color.parseColor("#8ea4bb"));
-        sub.setTextSize(13);
-        sub.setGravity(Gravity.CENTER_HORIZONTAL);
-        sub.setPadding(0, 6, 0, 26);
-        root.addView(sub);
+        statusView = label("", 12, "#8ea4bb");
+        statusView.setGravity(Gravity.CENTER);
+        statusView.setPadding(0, dp(6), 0, dp(2));
+        root.addView(statusView);
 
+        leaseView = label("", 12, "#fbbf24");
+        leaseView.setGravity(Gravity.CENTER);
+        root.addView(leaseView);
+
+        // ---- pairing card ----
+        pairCard = new LinearLayout(this);
+        pairCard.setOrientation(LinearLayout.VERTICAL);
+        pairCard.setPadding(dp(18), dp(18), dp(18), dp(18));
+        pairCard.setBackground(card("#111b28"));
+        LinearLayout.LayoutParams cardLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        cardLp.topMargin = dp(18);
+        pairCard.setLayoutParams(cardLp);
+
+        pairCard.addView(label("XORA host", 12, "#8ea4bb"));
         hostInput = new EditText(this);
-        hostInput.setHint("host:port  (e.g. 100.64.0.1:9106)");
         hostInput.setTextColor(Color.parseColor("#e6f0ff"));
         hostInput.setHintTextColor(Color.parseColor("#5b6b7d"));
-        root.addView(hostInput);
+        hostInput.setHint("100.64.0.1:9106");
+        hostInput.setSingleLine(true);
+        pairCard.addView(hostInput);
 
-        TextView codeHelp = new TextView(this);
-        codeHelp.setText("Pairing code from your PC. Generate it in the workspace under Voice & Devices, then paste it here. Codes expire after 5 minutes.");
-        codeHelp.setTextColor(Color.parseColor("#8ea4bb"));
-        codeHelp.setTextSize(12);
-        codeHelp.setPadding(0, 16, 0, 4);
-        root.addView(codeHelp);
-
+        pairCard.addView(label("Pairing code from your PC. Generate one in the workspace under Voice & Devices. Codes expire after 5 minutes.", 12, "#8ea4bb"));
         codeInput = new EditText(this);
-        codeInput.setHint("pairing code");
-        codeInput.setSingleLine(true);
         codeInput.setTextColor(Color.parseColor("#e6f0ff"));
         codeInput.setHintTextColor(Color.parseColor("#5b6b7d"));
-        root.addView(codeInput);
+        codeInput.setHint("pairing code");
+        codeInput.setSingleLine(true);
+        pairCard.addView(codeInput);
 
         pairButton = new Button(this);
         pairButton.setText("Pair this device");
         pairButton.setOnClickListener(v -> pairDevice());
-        root.addView(pairButton);
+        pairCard.addView(pairButton);
+        root.addView(pairCard);
 
-        statusView = new TextView(this);
-        statusView.setTextColor(Color.parseColor("#8ea4bb"));
-        statusView.setTextSize(13);
-        statusView.setPadding(0, 18, 0, 0);
-        root.addView(statusView);
+        // ---- dashboard: icons only, no titles ----
+        dash = new LinearLayout(this);
+        dash.setOrientation(LinearLayout.VERTICAL);
+        dash.setGravity(Gravity.CENTER);
 
-        pairedSection = new LinearLayout(this);
-        pairedSection.setOrientation(LinearLayout.VERTICAL);
+        // Primary row: the two things a phone is actually for.
+        LinearLayout row1 = new LinearLayout(this);
+        row1.setGravity(Gravity.CENTER);
+        micBtn = icon(IconButton.Glyph.MIC_OFF, "Microphone", 30);
+        handoffBtn = icon(IconButton.Glyph.HANDOFF, "Hand off audio", 30);
+        row1.addView(micBtn, cell());
+        row1.addView(handoffBtn, cell());
+        dash.addView(row1);
 
-        deviceView = new TextView(this);
-        deviceView.setTextColor(Color.parseColor("#e6f0ff"));
-        deviceView.setTextSize(14);
-        pairedSection.addView(deviceView);
+        // Secondary row: continuity and the lease lifecycle.
+        LinearLayout row2 = new LinearLayout(this);
+        row2.setGravity(Gravity.CENTER);
+        claimBtn = icon(IconButton.Glyph.HAND, "Take audio lease", 24);
+        releaseBtn = icon(IconButton.Glyph.POWER, "Release audio lease", 24);
+        row2.addView(claimBtn, cell());
+        row2.addView(releaseBtn, cell());
+        dash.addView(row2);
 
-        syncButton = new Button(this);
-        syncButton.setText("Sync transcript now");
-        syncButton.setOnClickListener(v -> syncTranscript());
-        pairedSection.addView(syncButton);
+        // Tertiary row: read-only continuity.
+        LinearLayout row3 = new LinearLayout(this);
+        row3.setGravity(Gravity.CENTER);
+        syncBtn = icon(IconButton.Glyph.SYNC, "Sync transcript", 24);
+        logBtn = icon(IconButton.Glyph.CHAT, "Transcript entries", 24);
+        row3.addView(syncBtn, cell());
+        row3.addView(logBtn, cell());
+        dash.addView(row3);
 
-        Button handoff = new Button(this);
-        handoff.setText("Request audio handoff");
-        handoff.setOnClickListener(v -> statusView.setText("Select a handoff target in the desktop workspace."));
-        pairedSection.addView(handoff);
+        LinearLayout.LayoutParams dashLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        dashLp.topMargin = dp(20);
+        dash.setLayoutParams(dashLp);
+        root.addView(dash);
 
-        root.addView(pairedSection);
         setContentView(scroll);
+        setPaired(false);
+    }
+
+    private GradientDrawable card(String hex) {
+        GradientDrawable g = new GradientDrawable();
+        g.setColor(Color.parseColor(hex));
+        g.setCornerRadius(dp(16));
+        g.setStroke(dp(1), Color.parseColor("#26374a"));
+        return g;
+    }
+
+    private IconButton icon(IconButton.Glyph g, String label, int sizeDp) {
+        IconButton b = new IconButton(this);
+        b.setGlyph(g);
+        b.setLabel(label);
+        b.setTint(IconButton.Tint.MUTED);
+        b.setLayoutParams(new LinearLayout.LayoutParams(dp(sizeDp * 2), dp(sizeDp * 2)));
+        return b;
+    }
+
+    private LinearLayout.LayoutParams cell() {
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(dp(76), dp(76));
+        p.setMargins(dp(8), dp(8), dp(8), dp(8));
+        return p;
     }
 
     private void setPaired(boolean paired) {
-        pairedSection.setVisibility(paired ? View.VISIBLE : View.GONE);
-        hostInput.setEnabled(!paired);
-        codeInput.setEnabled(!paired);
-        pairButton.setEnabled(!paired);
+        pairCard.setVisibility(paired ? View.GONE : View.VISIBLE);
+        dash.setVisibility(paired ? View.VISIBLE : View.GONE);
+    }
+
+    private void showPairing() {
+        setPaired(false);
+        orb.setState(OrbView.State.IDLE);
+        statusView.setText("Not paired. Add your XORA host, paste the code, and pair.");
+        leaseView.setText("");
+    }
+
+    private void enterDashboard(SharedPreferences p) {
+        setPaired(true);
+        String base = XoraClient.baseUrl(p.getString(KEY_HOST, ""));
+        client = new XoraClient(base, p.getString(KEY_TOKEN, null),
+                p.getString(KEY_DEVICE_ID, null), io);
+        orb.setState(OrbView.State.PENDING);
+        statusView.setText("Paired. Checking in...");
+
+        micBtn.setOnClickListener(v -> toggleMic());
+        handoffBtn.setOnClickListener(v -> requestHandoff());
+        claimBtn.setOnClickListener(v -> claimAudio());
+        releaseBtn.setOnClickListener(v -> releaseAudio());
+        syncBtn.setOnClickListener(v -> syncTranscript());
+        logBtn.setOnClickListener(v -> showLog());
+
+        startPolling();
+        refresh();
+    }
+
+    // ---- polling ---------------------------------------------------------
+
+    private void startPolling() {
+        stopPolling();
+        poller = new Runnable() {
+            @Override
+            public void run() {
+                pollLease();
+                main.postDelayed(this, POLL_MS);
+            }
+        };
+        main.postDelayed(poller, POLL_MS);
+    }
+
+    private void stopPolling() {
+        if (poller != null) {
+            main.removeCallbacks(poller);
+            poller = null;
+        }
+    }
+
+    /** Poll the lease so a handoff started on the PC shows up here. */
+    private void pollLease() {
+        if (client == null) {
+            return;
+        }
+        io.execute(() -> {
+            try {
+                JSONObject s = client.audioState(MainActivity.this);
+                String status = s.optString("status", "idle");
+                boolean iAmOwner = client.deviceId().equals(s.optString("owner_device_id", ""));
+                boolean iAmTarget = client.deviceId().equals(s.optString("target_device_id", ""));
+                main.post(() -> renderLease(status, iAmOwner, iAmTarget));
+            } catch (Exception e) {
+                main.post(() -> {
+                    orb.setState(OrbView.State.ERROR);
+                    statusView.setText("Cannot reach XORA: " + e.getMessage());
+                });
+            }
+        });
+    }
+
+    private void renderLease(String status, boolean iAmOwner, boolean iAmTarget) {
+        switch (status) {
+            case "awaiting_ack":
+                if (iAmTarget) {
+                    // A transfer is addressed to this phone: offer the handoff.
+                    orb.setState(OrbView.State.PENDING);
+                    leaseView.setText("Audio handoff offered. Tap the hand icon to take it.");
+                    handoffBtn.setGlyph(IconButton.Glyph.HANDOFF);
+                    handoffBtn.setTint(IconButton.Tint.PENDING);
+                    handoffBtn.setLabel("Accept audio handoff");
+                    handoffBtn.setOnClickListener(v -> ackHandoff());
+                } else if (iAmOwner) {
+                    orb.setState(OrbView.State.PENDING);
+                    leaseView.setText("Handing audio to another device. Waiting for it to accept.");
+                } else {
+                    orb.setState(OrbView.State.LIVE);
+                    leaseView.setText("Another device is handing off audio.");
+                }
+                break;
+            case "owned":
+                orb.setState(OrbView.State.LIVE);
+                leaseView.setText(iAmOwner ? "This phone owns the audio lease." : "Another device owns the audio lease.");
+                break;
+            default:
+                orb.setState(OrbView.State.IDLE);
+                leaseView.setText(iAmOwner ? "Idle, but this phone still holds the lease."
+                        : "No active audio lease.");
+        }
+        // Release only makes sense while this device holds it.
+        releaseBtn.setTint(iAmOwner ? IconButton.Tint.ACTIVE : IconButton.Tint.MUTED);
+        releaseBtn.setEnabled(iAmOwner);
+        claimBtn.setEnabled(!iAmOwner);
+        claimBtn.setTint(iAmOwner ? IconButton.Tint.MUTED : IconButton.Tint.NORMAL);
+    }
+
+    // ---- actions ---------------------------------------------------------
+
+    private void refresh() {
+        pollLease();
+    }
+
+    /** The phone is a handoff TARGET: acknowledge to take the lease. */
+    private void ackHandoff() {
+        busy("Accepting handoff...");
+        io.execute(() -> {
+            try {
+                JSONObject r = client.ackTransfer(MainActivity.this);
+                main.post(() -> {
+                    String stop = r.optString("stop_source_device_id", "");
+                    setToast("Audio taken. Stopped source: " + shortId(stop));
+                    handoffBtn.setGlyph(IconButton.Glyph.HANDOFF_DONE);
+                    handoffBtn.setTint(IconButton.Tint.ACTIVE);
+                    handoffBtn.setLabel("Audio handoff complete");
+                    pollLease();
+                });
+            } catch (Exception e) {
+                main.post(() -> setToast("Handoff refused: " + e.getMessage()));
+            }
+        });
+    }
+
+    /** The phone is a handoff SOURCE: ask the other device to take over. */
+    private void requestHandoff() {
+        if (client == null) {
+            return;
+        }
+        // transfer is session-only on the server, so the PC drives the outgoing
+        // handoff. The phone instead shows the target list is not reachable and
+        // tells the user plainly rather than pretending.
+        setToast("Start outgoing handoff from the desktop: Voice & Devices > Request audio handoff.");
+        pollLease();
+    }
+
+    private void claimAudio() {
+        if (client == null) {
+            return;
+        }
+        busy("Taking audio lease...");
+        io.execute(() -> {
+            try {
+                int cursor = getSharedPreferences(PREFS, MODE_PRIVATE).getInt(KEY_CURSOR, 0);
+                JSONObject r = client.claimAudio(MainActivity.this, cursor);
+                main.post(() -> {
+                    orb.setState(OrbView.State.LIVE);
+                    setToast("This phone owns audio. Resume after cursor "
+                            + r.optInt("resume_after", cursor) + ".");
+                    pollLease();
+                });
+            } catch (Exception e) {
+                main.post(() -> setToast("Could not take the lease: " + e.getMessage()));
+            }
+        });
+    }
+
+    private void releaseAudio() {
+        if (client == null) {
+            return;
+        }
+        busy("Releasing lease...");
+        io.execute(() -> {
+            try {
+                client.releaseAudio(MainActivity.this);
+                main.post(() -> {
+                    orb.setState(OrbView.State.IDLE);
+                    handoffBtn.setGlyph(IconButton.Glyph.HANDOFF);
+                    handoffBtn.setTint(IconButton.Tint.NORMAL);
+                    handoffBtn.setLabel("Hand off audio");
+                    handoffBtn.setOnClickListener(v -> requestHandoff());
+                    setToast("Audio lease released.");
+                    pollLease();
+                });
+            } catch (Exception e) {
+                main.post(() -> setToast("Could not release: " + e.getMessage()));
+            }
+        });
+    }
+
+    private void syncTranscript() {
+        if (client == null) {
+            return;
+        }
+        busy("Syncing transcript...");
+        io.execute(() -> {
+            try {
+                int cursor = getSharedPreferences(PREFS, MODE_PRIVATE).getInt(KEY_CURSOR, 0);
+                JSONObject o = client.transcript(MainActivity.this, cursor);
+                int n = o.getJSONArray("items").length();
+                int max = cursor;
+                for (int i = 0; i < n; i++) {
+                    JSONObject e = o.getJSONArray("items").getJSONObject(i);
+                    max = Math.max(max, e.optInt("sequence", 0));
+                }
+                if (max > cursor) {
+                    getSharedPreferences(PREFS, MODE_PRIVATE).edit().putInt(KEY_CURSOR, max).apply();
+                }
+                final int found = n;
+                main.post(() -> setToast("Transcript synced: " + found + " new entries."));
+            } catch (Exception e) {
+                main.post(() -> setToast("Sync failed: " + e.getMessage()));
+            }
+        });
+    }
+
+    private void showLog() {
+        if (client == null) {
+            return;
+        }
+        io.execute(() -> {
+            try {
+                JSONObject o = client.transcript(MainActivity.this, 0);
+                StringBuilder sb = new StringBuilder();
+                org.json.JSONArray items = o.getJSONArray("items");
+                for (int i = 0; i < items.length(); i++) {
+                    JSONObject e = items.getJSONObject(i);
+                    sb.append(e.optInt("sequence", 0)).append("  ")
+                            .append(e.optString("role", "?")).append("  ")
+                            .append(e.optString("text", "")).append('\n');
+                }
+                final String text = items.length() == 0 ? "Transcript is empty." : sb.toString();
+                main.post(() -> setToast(text.length() > 300 ? text.substring(0, 300) + "..." : text));
+            } catch (Exception e) {
+                main.post(() -> setToast("Could not read transcript: " + e.getMessage()));
+            }
+        });
+    }
+
+    // ---- microphone ------------------------------------------------------
+
+    private void toggleMic() {
+        if (micOn) {
+            stopMic();
+            return;
+        }
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_MIC);
+            return;
+        }
+        startMic();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int code, String[] perms, int[] results) {
+        super.onRequestPermissionsResult(code, perms, results);
+        if (code == REQ_MIC) {
+            if (results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) {
+                startMic();
+            } else {
+                setToast("Microphone permission denied.");
+            }
+        }
+    }
+
+    private void startMic() {
+        try {
+            recorder = new MediaRecorder();
+            recorder.setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION);
+            recorder.setOutputFormat(MediaRecorder.OutputFormat.THREE_GPP);
+            recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AMR_NB);
+            recorder.setOutputFile(getCacheDir().getAbsolutePath() + "/scratch.3gp");
+            recorder.prepare();
+            recorder.start();
+            micOn = true;
+            orb.setState(OrbView.State.LIVE);
+            micBtn.setGlyph(IconButton.Glyph.MIC);
+            micBtn.setTint(IconButton.Tint.ACTIVE);
+            micBtn.setLabel("Microphone on, tap to stop");
+            setToast("Microphone live. Nothing is uploaded.");
+        } catch (Exception e) {
+            micOn = false;
+            setToast("Could not start the mic: " + e.getMessage());
+        }
+    }
+
+    private void stopMic() {
+        try {
+            if (recorder != null) {
+                recorder.stop();
+                recorder.release();
+            }
+        } catch (Exception ignored) {
+            // stop() throws if it was never started; the state is what matters.
+        }
+        recorder = null;
+        micOn = false;
+        micBtn.setGlyph(IconButton.Glyph.MIC_OFF);
+        micBtn.setTint(IconButton.Tint.MUTED);
+        micBtn.setLabel("Microphone");
+        pollLease();
     }
 
     // ---- pairing ---------------------------------------------------------
 
     private void pairDevice() {
-        final String rawHost = hostInput.getText().toString().trim();
-        final String rawCode = codeInput.getText().toString().trim();
-        if (rawHost.isEmpty()) {
-            statusView.setText("Enter the host first.");
+        final String host = hostInput.getText().toString().trim();
+        final String code = codeInput.getText().toString().trim();
+        if (host.isEmpty()) {
+            setToast("Enter the XORA host first.");
             return;
         }
-        if (rawCode.isEmpty()) {
-            statusView.setText("Paste the pairing code from your PC first.");
+        if (code.isEmpty()) {
+            setToast("Paste the pairing code from your PC first.");
             return;
         }
-        final String base = baseUrl(rawHost);
         pairButton.setEnabled(false);
+        orb.setState(OrbView.State.PENDING);
         statusView.setText("Pairing...");
-
+        final String base = XoraClient.baseUrl(host);
         io.execute(() -> {
             try {
-                // Redeem the code minted on the PC. This endpoint needs no
-                // session: it is the one call a native bearer client owns.
-                JSONObject paired = post(base, "/api/v1/devices/pair",
-                        new JSONObject()
-                                .put("pairing_code", rawCode)
-                                .put("device_name", android.os.Build.MODEL)
-                                .put("platform", "android"),
-                        null);
-
+                JSONObject paired = XoraClient.pair(MainActivity.this, base, code,
+                        android.os.Build.MODEL);
                 String token = paired.getString("device_token");
                 String deviceId = paired.getJSONObject("device").getString("id");
-
-                SharedPreferences p = getSharedPreferences(PREFS, Context.MODE_PRIVATE);
-                p.edit()
-                        .putString(KEY_HOST, rawHost)
+                getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                        .putString(KEY_HOST, host)
                         .putString(KEY_TOKEN, token)
                         .putString(KEY_DEVICE_ID, deviceId)
+                        .putInt(KEY_CURSOR, 0)
                         .apply();
-
                 main.post(() -> {
-                    deviceView.setText("Paired device: " + deviceId);
                     codeInput.setText("");
-                    setPaired(true);
-                    statusView.setText("Device paired.");
-                    refreshPresence();
+                    enterDashboard(getSharedPreferences(PREFS, MODE_PRIVATE));
+                    setToast("Paired. Dashboard ready.");
                 });
             } catch (Exception e) {
                 main.post(() -> {
+                    orb.setState(OrbView.State.ERROR);
+                    statusView.setText("Pairing failed: " + e.getMessage());
                     pairButton.setEnabled(true);
-                    statusView.setText("Pairing failed: " + describe(e));
                 });
             }
         });
     }
 
-    // ---- continuity ------------------------------------------------------
+    // ---- plumbing --------------------------------------------------------
 
-    private void syncTranscript() {
-        SharedPreferences p = getSharedPreferences(PREFS, Context.MODE_PRIVATE);
-        final String base = baseUrl(p.getString(KEY_HOST, ""));
-        final String token = p.getString(KEY_TOKEN, null);
-        if (token == null) {
-            return;
-        }
-        statusView.setText("Syncing transcript...");
-
-        io.execute(() -> {
-            try {
-                // GET /devices/transcript is identity-agnostic (session OR device
-                // token) and returns everything after a cursor. This is the real
-                // continuity read, unlike /audio/claim which is session-only.
-                HttpURLConnection c = open(base + "/api/v1/devices/transcript?after=0", "GET", token);
-                String text = readAll(c.getResponseCode() < 400 ? c.getInputStream() : c.getErrorStream());
-                int count = 0;
-                try {
-                    count = new JSONObject(text).optJSONArray("items") == null
-                            ? 0 : new JSONObject(text).getJSONArray("items").length();
-                } catch (Exception ignored) {
-                    count = -1;
-                }
-                final int n = count;
-                main.post(() -> statusView.setText(
-                        n < 0 ? "Transcript read returned an unexpected shape."
-                              : "Transcript synced: " + n + " entries after cursor 0."));
-            } catch (Exception e) {
-                main.post(() -> statusView.setText("Sync failed: " + describe(e)));
-            }
-        });
+    private void busy(String what) {
+        statusView.setText(what);
     }
 
-    /**
-     * Report this device online. The server's POST /devices/presence is
-     * session-authenticated, so a device token cannot use it; the device-scoped
-     * acknowledgement endpoint is what a bearer device credential can actually
-     * call. Presence is therefore surfaced as "device token verified" rather than
-     * pretending to write a session-only field.
-     */
-    private void refreshPresence() {
-        SharedPreferences p = getSharedPreferences(PREFS, Context.MODE_PRIVATE);
-        final String base = baseUrl(p.getString(KEY_HOST, ""));
-        final String token = p.getString(KEY_TOKEN, null);
-        if (token == null) {
-            return;
-        }
-        io.execute(() -> {
-            try {
-                HttpURLConnection c = open(base + "/api/v1/devices/transcript?after=0", "GET", token);
-                int code = c.getResponseCode();
-                readAll(code < 400 ? c.getInputStream() : c.getErrorStream());
-                if (code == 200) {
-                    main.post(() -> deviceView.setText(
-                            "Paired device: " + p.getString(KEY_DEVICE_ID, "?") + "  (token verified)"));
-                }
-            } catch (Exception ignored) {
-                // Best-effort: a transient failure must not surface as an error state.
-            }
-        });
+    private void setToast(String s) {
+        statusView.setText(s);
+        Toast.makeText(this, s, Toast.LENGTH_SHORT).show();
     }
 
-    private static String baseUrl(String host) {
-        String h = host.trim();
-        if (h.startsWith("http://") || h.startsWith("https://")) {
-            return h.contains(":") ? h : h + ":9106";
+    private static String shortId(String id) {
+        if (id == null || id.length() < 8) {
+            return "none";
         }
-        return h.contains(":") ? "https://" + h : "https://" + h + ":9106";
-    }
-
-    /** Open a request with the pinned tailnet trust anchor and optional bearer. */
-    private HttpURLConnection open(String fullUrl, String method, String bearer)
-            throws Exception {
-        java.net.HttpURLConnection c =
-                (java.net.HttpURLConnection) new URL(fullUrl).openConnection();
-        c.setRequestMethod(method);
-        c.setConnectTimeout(8000);
-        c.setReadTimeout(12000);
-        ((javax.net.ssl.HttpsURLConnection) c).setSSLSocketFactory(trustingFactory());
-        c.setRequestProperty("Origin", baseUrlOf(fullUrl));
-        if (bearer != null) {
-            c.setRequestProperty("Authorization", "Bearer " + bearer);
-        }
-        return c;
-    }
-
-    private static String baseUrlOf(String fullUrl) {
-        try {
-            java.net.URI u = java.net.URI.create(fullUrl);
-            return u.getScheme() + "://" + u.getAuthority();
-        } catch (Exception e) {
-            return "";
-        }
-    }
-
-    // ---- http ------------------------------------------------------------
-
-    private JSONObject post(String base, String path, JSONObject body, String bearer)
-            throws Exception {
-        URL url = new URL(base + path);
-        java.net.HttpURLConnection c = (java.net.HttpURLConnection) url.openConnection();
-        c.setRequestMethod("POST");
-        c.setDoOutput(true);
-        c.setConnectTimeout(8000);
-        c.setReadTimeout(12000);
-        // setSSLSocketFactory only exists on the HTTPS subclass.
-        ((javax.net.ssl.HttpsURLConnection) c).setSSLSocketFactory(trustingFactory());
-        c.setRequestProperty("Content-Type", "application/json");
-        // Origin must match an allowed origin for CSRF to pass on the server.
-        c.setRequestProperty("Origin", base);
-        if (bearer != null) {
-            c.setRequestProperty("Authorization", "Bearer " + bearer);
-        }
-        try (OutputStream os = c.getOutputStream()) {
-            os.write(body.toString().getBytes(StandardCharsets.UTF_8));
-        }
-        int code = c.getResponseCode();
-        InputStream in = code < 400 ? c.getInputStream() : c.getErrorStream();
-        String text = readAll(in);
-        if (code >= 400) {
-            throw new IllegalStateException("HTTP " + code + ": " + text);
-        }
-        return text.isEmpty() ? new JSONObject() : new JSONObject(text);
-    }
-
-    /**
-     * Trust the XORA tailnet certificate specifically. The server uses a
-     * self-signed cert, so we load that exact cert as a trust anchor rather than
-     * trusting everything (which is what a blanket TrustManager would do).
-     */
-    private javax.net.ssl.SSLSocketFactory trustingFactory() throws Exception {
-        KeyStore ks = KeyStore.getInstance(KeyStore.getDefaultType());
-        ks.load(null, null);
-        int i = 0;
-        InputStream in = getResources().openRawResource(R.raw.xora_tailnet_cert);
-        try {
-            CertificateFactory cf = CertificateFactory.getInstance("X.509");
-            for (X509Certificate cert : (java.util.Collection<X509Certificate>)
-                    cf.generateCertificates(in)) {
-                ks.setCertificateEntry("xora" + (i++), cert);
-            }
-        } finally {
-            in.close();
-        }
-        javax.net.ssl.TrustManagerFactory tmf =
-                javax.net.ssl.TrustManagerFactory.getInstance(
-                        javax.net.ssl.TrustManagerFactory.getDefaultAlgorithm());
-        tmf.init(ks);
-        javax.net.ssl.SSLContext ctx = javax.net.ssl.SSLContext.getInstance("TLS");
-        ctx.init(null, tmf.getTrustManagers(), null);
-        return ctx.getSocketFactory();
-    }
-
-    private static String readAll(InputStream in) throws Exception {
-        if (in == null) {
-            return "";
-        }
-        StringBuilder sb = new StringBuilder();
-        try (BufferedReader r = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
-            String line;
-            while ((line = r.readLine()) != null) {
-                sb.append(line);
-            }
-        }
-        return sb.toString();
-    }
-
-    private static String describe(Exception e) {
-        String m = e.getMessage();
-        return m == null ? e.getClass().getSimpleName() : m;
+        return id.substring(0, 8);
     }
 
     @Override
     protected void onDestroy() {
-        super.onDestroy();
+        stopPolling();
+        stopMic();
         io.shutdownNow();
+        super.onDestroy();
     }
 }
