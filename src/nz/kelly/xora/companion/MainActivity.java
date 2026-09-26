@@ -40,11 +40,15 @@ import java.util.concurrent.Executors;
  * pairing flow against the XORA device API, and its own credential storage. It
  * holds no session cookie and never handles the owner's password after pairing.
  *
- * Pairing follows the server contract in app/devices/models.py:
+ * Pairing follows the server contract in app/devices/router.py:
  *   POST /api/v1/devices/pairing-codes  -> { pairing_code, expires_in }
  *   POST /api/v1/devices/pair           -> { device: {...}, device_token }
- * The code is minted and redeemed by this app, so no code needs to be copied
- * between devices.
+ *
+ * Only the SECOND call can be made by a native app. The mint endpoint sits
+ * behind get_current_user plus a double-submit CSRF cookie, so it needs a
+ * password session this app deliberately never has. The code is therefore
+ * minted on the PC (Voice & Devices panel) and pasted here; this app only
+ * redeems it, which is exactly what a bearer device credential is allowed to do.
  */
 public class MainActivity extends Activity {
 
@@ -57,6 +61,7 @@ public class MainActivity extends Activity {
     private final Handler main = new Handler(Looper.getMainLooper());
 
     private EditText hostInput;
+    private EditText codeInput;
     private TextView statusView;
     private TextView deviceView;
     private Button pairButton;
@@ -110,6 +115,20 @@ public class MainActivity extends Activity {
         hostInput.setHintTextColor(Color.parseColor("#5b6b7d"));
         root.addView(hostInput);
 
+        TextView codeHelp = new TextView(this);
+        codeHelp.setText("Pairing code from your PC. Generate it in the workspace under Voice & Devices, then paste it here. Codes expire after 5 minutes.");
+        codeHelp.setTextColor(Color.parseColor("#8ea4bb"));
+        codeHelp.setTextSize(12);
+        codeHelp.setPadding(0, 16, 0, 4);
+        root.addView(codeHelp);
+
+        codeInput = new EditText(this);
+        codeInput.setHint("pairing code");
+        codeInput.setSingleLine(true);
+        codeInput.setTextColor(Color.parseColor("#e6f0ff"));
+        codeInput.setHintTextColor(Color.parseColor("#5b6b7d"));
+        root.addView(codeInput);
+
         pairButton = new Button(this);
         pairButton.setText("Pair this device");
         pairButton.setOnClickListener(v -> pairDevice());
@@ -146,6 +165,7 @@ public class MainActivity extends Activity {
     private void setPaired(boolean paired) {
         pairedSection.setVisibility(paired ? View.VISIBLE : View.GONE);
         hostInput.setEnabled(!paired);
+        codeInput.setEnabled(!paired);
         pairButton.setEnabled(!paired);
     }
 
@@ -153,8 +173,13 @@ public class MainActivity extends Activity {
 
     private void pairDevice() {
         final String rawHost = hostInput.getText().toString().trim();
+        final String rawCode = codeInput.getText().toString().trim();
         if (rawHost.isEmpty()) {
             statusView.setText("Enter the host first.");
+            return;
+        }
+        if (rawCode.isEmpty()) {
+            statusView.setText("Paste the pairing code from your PC first.");
             return;
         }
         final String base = baseUrl(rawHost);
@@ -163,18 +188,11 @@ public class MainActivity extends Activity {
 
         io.execute(() -> {
             try {
-                // Step 1: mint a single-use code for this device.
-                JSONObject minted = post(base, "/api/v1/devices/pairing-codes",
-                        new JSONObject()
-                                .put("device_name", android.os.Build.MODEL)
-                                .put("platform", "android"),
-                        null);
-                String code = minted.getString("pairing_code");
-
-                // Step 2: redeem it immediately for a long-lived device token.
+                // Redeem the code minted on the PC. This endpoint needs no
+                // session: it is the one call a native bearer client owns.
                 JSONObject paired = post(base, "/api/v1/devices/pair",
                         new JSONObject()
-                                .put("pairing_code", code)
+                                .put("pairing_code", rawCode)
                                 .put("device_name", android.os.Build.MODEL)
                                 .put("platform", "android"),
                         null);
@@ -191,6 +209,7 @@ public class MainActivity extends Activity {
 
                 main.post(() -> {
                     deviceView.setText("Paired device: " + deviceId);
+                    codeInput.setText("");
                     setPaired(true);
                     statusView.setText("Device paired.");
                     refreshPresence();
