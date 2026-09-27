@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>XORA</title>
+<style>
+  /*
+     The Orb host page for the Android companion.
+
+     STATUS: the Orb loads, boots, and reports ready, but renders BLACK on this
+     device. This is a known-open defect, not a finished feature. Everything
+     below that is not layout is instrumentation-free on purpose: three previous
+     diagnosis rounds each added probes that produced false readings (a green
+     WebGL test canvas was briefly mistaken for the Orb itself), so this file is
+     kept minimal to keep future measurements honest.
+
+     What is PROVEN on this device (S23, dpr 2.8125):
+       - WebGL 2.0 works: a raw clear-to-green returns (0,255,0,255).
+       - EXT_color_buffer_half_float and EXT_float_blend are both available,
+         so EffectComposer's HalfFloatType target is supported.
+       - EffectComposer + RenderPass renders correctly (max=255, 31k lit px).
+       - The Orb's exact material (PointsMaterial, additive, CanvasTexture
+         glow map, 380 Fibonacci points) renders correctly in isolation at the
+         same camera distance (lit=338 px).
+       - The live Orb's own scene reports correct state: 7 children, core
+         visible and parented, 380 points, texture present, 3 passes, running,
+         camera z == baseCamZ == 11.30, size 384x384, no GL error.
+
+     So Three.js, the import map, the material, the texture, the post chain,
+     the camera math and the Android compositor are all ruled out. The fault is
+     inside holo-orb.js's own render path and is NOT YET DIAGNOSED. The
+     readPixels-based probes all reported lit=0 even while the app was healthy,
+     because a WebGL drawing buffer is cleared once presented, so those numbers
+     must not be trusted; only a screencap is trustworthy on this device.
+
+     Loading the real module is still the right architecture (the deleted
+     Canvas 2D port could never reproduce additive blending or bloom), so this
+     approach is kept while the render bug is fixed.
+  */
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: transparent;   /* so the native window colour shows through */
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+  /*
+     #stage and #orbMount are the two ids holo-orb.js requires; it bails out
+     early without them.
+
+     The Orb is confined to a SQUARE band in the middle of the screen rather than
+     filling it. fitOrb() pushes the camera back to whichever of distV/distH is
+     larger, so on a 1080x2316 phone a full-height canvas is 2.14x taller than
+     wide and the camera retreats. A square stage makes distV == distH, matching
+     the geometry the desktop shell effectively uses. This sizing is NOT the
+     cause of the black render -- the scene reports camZ == baseCamZ and a correct
+     384x384 stage -- it is kept because it is the right proportions for a phone.
+  */
+  #stage, #orbMount {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 50%;
+    transform: translateY(-58%);
+    width: 100%;
+    /* Square by width; falls back to a sane height on odd aspect ratios. */
+    height: 100vw;
+    max-height: 78vh;
+    min-height: 46vh;
+    aspect-ratio: 1 / 1;
+  }
+  /* Keep the canvas from being treated as a draggable image on some WebViews. */
+  #orbCanvas { -webkit-user-drag: none; user-select: none; }
+</style>
+<script type="importmap">
+{"imports":{"three":"/static/vendor/three/three.module.js","three/addons/":"/static/vendor/three/addons/"}}
+</script>
+</head>
+<body>
+  <div id="stage"><div id="orbMount"></div></div>
+
+  <!--
+    The phone asks the real Orb for 25% more light. holo-orb.js reads this
+    global; it defaults to 1.0, so the desktop shell is unaffected. It must be
+    a global rather than a ?gain= query on the module tag, because inside a
+    module window.location describes the DOCUMENT, not the script's own src, so
+    a query string there is invisible and silently yields 1.0.
+  -->
+  <script>window.__ORB_GAIN = 1.25;</script>
+  <script type="module" src="/static/holo-orb.js"></script>
+
+  <script>
+    /*
+     * Tell the host the Orb booted, so the activity can hold the WebView
+     * transparent until it is safe to show and never flashes an empty white box.
+     * Also relays errors rather than leaving a blank transparent screen.
+     */
+    (function () {
+      var posted = false;
+      function post(msg) {
+        if (window.XoraAndroid) { window.XoraAndroid.postMessage(JSON.stringify(msg)); }
+      }
+      // addJavascriptInterface is injected asynchronously, so poll for the
+      // bridge and post as soon as BOTH the orb and the bridge are present.
+      var iv = setInterval(function () {
+        if (window.XoraOrb) {
+          if (window.XoraAndroid) {
+            clearInterval(iv);
+            if (!posted) { posted = true; post({ type: 'orb-ready' }); }
+          }
+        }
+      }, 50);
+      window.addEventListener('error', function (e) {
+        post({ type: 'orb-error', message: String(e.message || e) });
+      });
+    })();
+  </script>
+</body>
+</html>

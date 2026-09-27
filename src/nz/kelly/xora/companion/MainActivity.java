@@ -16,9 +16,15 @@ import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Button;
+import android.webkit.JavascriptInterface;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
+import android.webkit.WebSettings;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
-import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -61,9 +67,15 @@ public class MainActivity extends Activity {
     private final Handler main = new Handler(Looper.getMainLooper());
     private Runnable poller;
 
-    private OrbView orb;
     private TextView statusView;
     private TextView leaseView;
+
+    /*
+     * The Orb is a WebView running the REAL holo-orb.js from the server, not a
+     * Canvas reimplementation. See res/raw/orb_host.html for why.
+     */
+    private WebView orbWeb;
+    private volatile boolean orbReady = false;
 
     // pairing surface
     private LinearLayout pairCard;
@@ -71,10 +83,15 @@ public class MainActivity extends Activity {
     private EditText codeInput;
     private Button pairButton;
 
-    // dashboard surface
-    private LinearLayout dash;
+    // dashboard surface: one floating dock plus a grouped panel tray
+    private LinearLayout dock;
+    private LinearLayout panelTray;
+    private LinearLayout centerColumn;
+    private IconButton panelsBtn;
     private IconButton micBtn;
     private IconButton handoffBtn;
+    private IconButton chatBtn;
+    private IconButton friendsBtn;
     private IconButton syncBtn;
     private IconButton claimBtn;
     private IconButton releaseBtn;
@@ -115,48 +132,199 @@ public class MainActivity extends Activity {
         return t;
     }
 
+    /**
+     * Load the real Orb from the paired host's /static over the pinned TLS cert.
+     *
+     * The host page is bundled in res/raw so the shell of the app is local, but
+     * the Orb itself, Three.js and the postprocessing addons all come from the
+     * server the phone is already paired with. That is the whole point: it is
+     * literally the same holo-orb.js the desktop runs, so it cannot drift.
+     */
+    private void loadOrb(String host) {
+        if (orbWeb == null) {
+            return;
+        }
+        final String base = XoraClient.baseUrl(host);
+        final String html = "file:///android_asset/orb_host.html";
+        final String target = html + "#" + base;
+        orbReady = false;
+        // The bundled page is a file:// document, so its own /static references
+        // need an explicit origin. Injecting it per-load is the simplest correct
+        // approach: a <base> tag makes the module and import map resolve against
+        // the paired host rather than the (nonexistent) file:// origin.
+        orbWeb.loadDataWithBaseURL(
+                base,
+                injectOrbBase(readRawAsset("orb_host.html"), base),
+                "text/html",
+                "UTF-8",
+                null);
+    }
+
+    /** Rewrite the bundled page so its /static URLs resolve to the paired host. */
+    private String injectOrbBase(String html, String base) {
+        // The page already ships the absolute /static paths and an import map;
+        // the base URL supplied to loadDataWithBaseURL resolves them. All that
+        // is strictly needed is to make sure there is no file:// leftover.
+        return html.replace("file://", base + "/");
+    }
+
+    private String readRawAsset(String name) {
+        try (java.io.InputStream in = getResources().openRawResource(R.raw.orb_host)) {
+            java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                bos.write(buf, 0, n);
+            }
+            return bos.toString("UTF-8");
+        } catch (Exception e) {
+            android.util.Log.e("XoraOrb", "could not read raw asset " + name, e);
+            return "<html><body></body></html>";
+        }
+    }
+
+    /** Receives lifecycle messages from the Orb host page. */
+    private final class OrbBridge {
+        @JavascriptInterface
+        public void postMessage(String raw) {
+            try {
+                org.json.JSONObject o = new org.json.JSONObject(raw);
+                String type = o.optString("type");
+                if ("orb-ready".equals(type)) {
+                    orbReady = true;
+                    android.util.Log.i("XoraOrb", "real holo-orb.js reported ready");
+                } else if ("orb-error".equals(type)) {
+                    android.util.Log.e("XoraOrb", "orb host error: " + o.optString("message"));
+                }
+            } catch (Exception e) {
+                android.util.Log.e("XoraOrb", "bad bridge payload: " + raw, e);
+            }
+        }
+    }
+
+    /**
+     * Pause or resume the real Orb.
+     *
+     * The real window.XoraOrb API is { setActive(bool), setOrbType(str),
+     * setRingType(str), dispose(), ready }. setActive is a PAUSE control, not a
+     * state colour: it backs the desktop's "Companion paused" toggle. holo-orb.js
+     * deliberately exposes no state-colour entry point, so the phone does not
+     * invent one. Connection state is carried by the status dot and the status
+     * line, which is the same division of labour the desktop already uses.
+     */
+    private void setOrbActive(final boolean active) {
+        runOnUiThread(() -> {
+            if (orbWeb == null) {
+                return;
+            }
+            orbWeb.evaluateJavascript(
+                    "(function(){var o=window.XoraOrb;if(!o||!o.setActive){return false;}"
+                            + "o.setActive(" + active + ");return true;})()",
+                    value -> {
+                        if (value != null && value.contains("false")) {
+                            android.util.Log.w("XoraOrb", "XoraOrb API absent; setActive not applied");
+                        }
+                    });
+        });
+    }
+
     private void buildUi() {
-        ScrollView scroll = new ScrollView(this);
-        scroll.setBackgroundColor(Color.parseColor("#070b12"));
-        LinearLayout root = new LinearLayout(this);
-        root.setOrientation(LinearLayout.VERTICAL);
-        root.setGravity(Gravity.CENTER_HORIZONTAL);
-        root.setPadding(dp(20), dp(28), dp(20), dp(28));
-        scroll.addView(root);
+        // FrameLayout, not a ScrollView: the Orb must be the full-bleed
+        // background with the dock floating over it, exactly like the desktop
+        // shell. There is NO title bar and no app bar.
+        FrameLayout frame = new FrameLayout(this);
+        frame.setBackgroundColor(Color.parseColor("#070b12"));
 
-        // ---- the Orb is the main focus: top of screen, dominant size ----
-        orb = new OrbView(this);
-        orb.setContentDescription("XORA Orb. Tap to refresh connection.");
-        LinearLayout.LayoutParams orbLp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(250));
-        root.addView(orb, orbLp);
+        // ---- the Orb: the real holo-orb.js, in a transparent WebView ----------
+        // This replaces a native Canvas OrbView, which was the wrong tool: the
+        // real Orb is Three.js + UnrealBloomPass with additive blending, and
+        // Canvas 2D cannot blend additively, so the bloom stacked into a flat
+        // violet disc and the twinkle flashed white. Running the actual module
+        // is both less code and the only way it looks like the desktop.
+        orbWeb = new WebView(this);
+        WebSettings ws = orbWeb.getSettings();
+        ws.setJavaScriptEnabled(true);
+        ws.setDomStorageEnabled(false);
+        // The Orb is our own code from our own pinned host. It needs no file
+        // access, no geolocation, no third-party cookies.
+        ws.setAllowFileAccess(false);
+        ws.setAllowContentAccess(false);
+        ws.setMediaPlaybackRequiresUserGesture(true);
+        ws.setCacheMode(WebSettings.LOAD_NO_CACHE);
+        ws.setUseWideViewPort(false);
+        ws.setLoadWithOverviewMode(false);
+        ws.setSupportZoom(false);
+        ws.setBuiltInZoomControls(false);
+        ws.setDisplayZoomControls(false);
+        // Transparent so the native window background (#070b12) is the Orb's
+        // backdrop, with the native dock floating over the top of it.
+        orbWeb.setBackgroundColor(0x00000000);
+        orbWeb.setLayerType(View.LAYER_TYPE_HARDWARE, null);
+        // Touch belongs to the dock; the Orb's own drag/repel would fight it.
+        orbWeb.setOnTouchListener((v, ev) -> false);
+        // Keep the old affordance: tapping the Orb refreshes the connection.
+        orbWeb.setOnClickListener(v -> refresh());
+        orbWeb.setContentDescription("XORA Orb. Tap to refresh connection.");
+        orbWeb.addJavascriptInterface(new OrbBridge(), "XoraAndroid");
+        // Refuse to navigate anywhere: a redirect off-host would break the
+        // pinned-cert guarantee the rest of the app depends on.
+        orbWeb.setWebViewClient(new WebViewClient() {
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, String url) {
+                return true;
+            }
 
-        orb.setOnClickListener(v -> refresh());
+            @Override
+            public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest req) {
+                return null; // load normally; same-origin is pinned by the host
+            }
+        });
+        FrameLayout.LayoutParams orbLp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
+        frame.addView(orbWeb, orbLp);
+        // The Orb renders from the paired host's /static. Until it is paired
+        // there is no origin to load, so the WebView stays empty and the pair
+        // card is all the user sees.
+        loadOrb(getSharedPreferences(PREFS, MODE_PRIVATE)
+                .getString(KEY_HOST, DEFAULT_HOST));
 
-        TextView title = label("XORA", 20, "#61e8ff");
-        title.setGravity(Gravity.CENTER);
-        root.addView(title);
+        // Status sits just under the Orb, deliberately minimal: the Orb's colour
+        // is the primary state signal, so the text only confirms it in words.
+        centerColumn = new LinearLayout(this);
+        centerColumn.setOrientation(LinearLayout.VERTICAL);
+        centerColumn.setGravity(Gravity.CENTER_HORIZONTAL);
+        centerColumn.addView(new View(this), new LinearLayout.LayoutParams(1, 0, 1f));
 
-        statusView = label("", 12, "#8ea4bb");
+        statusView = label("", 11, "#8ea4bb");
         statusView.setGravity(Gravity.CENTER);
-        statusView.setPadding(0, dp(6), 0, dp(2));
-        root.addView(statusView);
+        statusView.setPadding(0, dp(10), 0, 0);
+        centerColumn.addView(statusView);
 
-        leaseView = label("", 12, "#fbbf24");
+        leaseView = label("", 11, "#fbbf24");
         leaseView.setGravity(Gravity.CENTER);
-        root.addView(leaseView);
+        centerColumn.addView(leaseView);
 
-        // ---- pairing card ----
+        // Push the text block below the Orb's visual centre, leaving room for
+        // the floating dock at the bottom.
+        centerColumn.addView(new View(this), new LinearLayout.LayoutParams(1, 0, 2.4f));
+
+        FrameLayout.LayoutParams centreLp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
+        centreLp.bottomMargin = dp(150);
+        frame.addView(centerColumn, centreLp);
+
+        // ---- pairing card (only when not paired) --------------------------
         pairCard = new LinearLayout(this);
         pairCard.setOrientation(LinearLayout.VERTICAL);
         pairCard.setPadding(dp(18), dp(18), dp(18), dp(18));
         pairCard.setBackground(card("#111b28"));
-        LinearLayout.LayoutParams cardLp = new LinearLayout.LayoutParams(
+        FrameLayout.LayoutParams cardLp = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        cardLp.topMargin = dp(18);
-        pairCard.setLayoutParams(cardLp);
-
-        pairCard.addView(label("XORA host", 12, "#8ea4bb"));
+        cardLp.gravity = Gravity.CENTER;
+        cardLp.leftMargin = dp(24);
+        cardLp.rightMargin = dp(24);
+        cardLp.bottomMargin = dp(110);
+        frame.addView(pairCard, cardLp);
         hostInput = new EditText(this);
         hostInput.setTextColor(Color.parseColor("#e6f0ff"));
         hostInput.setHintTextColor(Color.parseColor("#5b6b7d"));
@@ -176,58 +344,157 @@ public class MainActivity extends Activity {
         pairButton.setText("Pair this device");
         pairButton.setOnClickListener(v -> pairDevice());
         pairCard.addView(pairButton);
-        root.addView(pairCard);
 
-        // ---- dashboard: icons only, no titles ----
-        dash = new LinearLayout(this);
-        dash.setOrientation(LinearLayout.VERTICAL);
-        dash.setGravity(Gravity.CENTER);
+        // ---- grouped panel tray: opens from the PANELS dock button ---------
+        panelTray = buildPanelTray();
+        FrameLayout.LayoutParams trayLp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        trayLp.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+        trayLp.bottomMargin = dp(74);
+        frame.addView(panelTray, trayLp);
 
-        // Primary row: the two things a phone is actually for.
-        LinearLayout row1 = new LinearLayout(this);
-        row1.setGravity(Gravity.CENTER);
-        micBtn = icon(IconButton.Glyph.MIC_OFF, "Microphone", 30);
-        handoffBtn = icon(IconButton.Glyph.HANDOFF, "Hand off audio", 30);
-        row1.addView(micBtn, cell());
-        row1.addView(handoffBtn, cell());
-        dash.addView(row1);
+        // ---- the floating dock --------------------------------------------
+        dock = new LinearLayout(this);
+        dock.setOrientation(LinearLayout.HORIZONTAL);
+        dock.setGravity(Gravity.CENTER);
+        dock.setBackground(dockBackground());
+        dock.setPadding(dp(6), dp(6), dp(6), dp(6));
+        dock.setElevation(dp(12));
 
-        // Secondary row: continuity and the lease lifecycle.
-        LinearLayout row2 = new LinearLayout(this);
-        row2.setGravity(Gravity.CENTER);
-        claimBtn = icon(IconButton.Glyph.HAND, "Take audio lease", 24);
-        releaseBtn = icon(IconButton.Glyph.POWER, "Release audio lease", 24);
-        row2.addView(claimBtn, cell());
-        row2.addView(releaseBtn, cell());
-        dash.addView(row2);
-
-        // Tertiary row: read-only continuity.
-        LinearLayout row3 = new LinearLayout(this);
-        row3.setGravity(Gravity.CENTER);
-        syncBtn = icon(IconButton.Glyph.SYNC, "Sync transcript", 24);
-        logBtn = icon(IconButton.Glyph.CHAT, "Transcript entries", 24);
-        row3.addView(syncBtn, cell());
-        row3.addView(logBtn, cell());
-        dash.addView(row3);
-
-        // Quaternary row: escape hatch. Without this the app is a dead end when
-        // it is pointed at the wrong host, because the pairing card is hidden
-        // whenever a token exists and there is no way back to it.
-        LinearLayout row4 = new LinearLayout(this);
-        row4.setGravity(Gravity.CENTER);
-        hostBtn = icon(IconButton.Glyph.CLOSE, "Change host or unpair", 24);
+        panelsBtn = icon(IconButton.Glyph.PANELS, "Panels", 15);
+        panelsBtn.setOnClickListener(v -> togglePanelTray());
+        micBtn = icon(IconButton.Glyph.MIC_OFF, "Microphone", 15);
+        micBtn.setOnClickListener(v -> toggleMic());
+        handoffBtn = icon(IconButton.Glyph.HANDOFF, "Hand off audio", 15);
+        handoffBtn.setOnClickListener(v -> requestHandoff());
+        chatBtn = icon(IconButton.Glyph.CHAT, "Chat", 15);
+        chatBtn.setOnClickListener(v -> setToast("Chat is a desktop surface. Open the XORA workspace on the PC."));
+        friendsBtn = icon(IconButton.Glyph.PEOPLE, "Friends", 15);
+        friendsBtn.setOnClickListener(v -> setToast("Friends is a desktop surface. Open the XORA workspace on the PC."));
+        syncBtn = icon(IconButton.Glyph.SYNC, "Sync transcript", 15);
+        syncBtn.setOnClickListener(v -> syncTranscript());
+        logBtn = icon(IconButton.Glyph.NOTE, "Transcript entries", 15);
+        logBtn.setOnClickListener(v -> showLog());
+        claimBtn = icon(IconButton.Glyph.HAND, "Take audio lease", 15);
+        claimBtn.setOnClickListener(v -> claimAudio());
+        releaseBtn = icon(IconButton.Glyph.POWER, "Release audio lease", 15);
+        releaseBtn.setOnClickListener(v -> releaseAudio());
+        hostBtn = icon(IconButton.Glyph.LOCK, "Change host or unpair", 15);
         hostBtn.setOnClickListener(v -> changeHostOrUnpair());
-        row4.addView(hostBtn, cell());
-        dash.addView(row4);
 
-        LinearLayout.LayoutParams dashLp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        dashLp.topMargin = dp(20);
-        dash.setLayoutParams(dashLp);
-        root.addView(dash);
+        for (IconButton b : dockOrder()) {
+            dock.addView(b, dockCell());
+        }
 
-        setContentView(scroll);
+        FrameLayout.LayoutParams dockLp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        dockLp.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+        dockLp.bottomMargin = dp(16);
+        frame.addView(dock, dockLp);
+
+        setContentView(frame);
         setPaired(false);
+    }
+
+    /** Dock order: panels, mic, handoff, chat, friends, then continuity. */
+    private IconButton[] dockOrder() {
+        return new IconButton[]{panelsBtn, micBtn, handoffBtn, chatBtn, friendsBtn,
+                syncBtn, logBtn, claimBtn, releaseBtn, hostBtn};
+    }
+
+    private LinearLayout.LayoutParams dockCell() {
+        int s = dp(32);
+        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(s, s);
+        p.setMargins(dp(2), dp(2), dp(2), dp(2));
+        return p;
+    }
+
+    /** Translucent rounded dock, macOS style: floating, no hard edge. */
+    private GradientDrawable dockBackground() {
+        GradientDrawable g = new GradientDrawable();
+        g.setColor(Color.parseColor("#d2101826"));
+        g.setCornerRadius(dp(26));
+        g.setStroke(dp(1), Color.parseColor("#4d61e8ff"));
+        return g;
+    }
+
+    /**
+     * The grouped panel tray. It mirrors the unified shell's own project list, so
+     * the phone offers exactly the panels the desktop offers, grouped by purpose
+     * rather than dumped flat.
+     */
+    private LinearLayout buildPanelTray() {
+        LinearLayout tray = new LinearLayout(this);
+        tray.setOrientation(LinearLayout.VERTICAL);
+        tray.setVisibility(View.GONE);
+        tray.setBackground(dockBackground());
+        tray.setPadding(dp(12), dp(10), dp(12), dp(12));
+        tray.setElevation(dp(11));
+
+        tray.addView(groupHeader("Trading"));
+        tray.addView(trayRow(new IconButton[]{
+                trayIcon(IconButton.Glyph.CHART, "MultiHedge"),
+                trayIcon(IconButton.Glyph.COIN, "Finance")}));
+
+        tray.addView(groupHeader("Knowledge"));
+        tray.addView(trayRow(new IconButton[]{
+                trayIcon(IconButton.Glyph.BOOK, "Knowledge"),
+                trayIcon(IconButton.Glyph.SPARK, "Skills")}));
+
+        tray.addView(groupHeader("Work"));
+        tray.addView(trayRow(new IconButton[]{
+                trayIcon(IconButton.Glyph.TERMINAL, "Hermes"),
+                trayIcon(IconButton.Glyph.GRID, "Projects")}));
+
+        tray.addView(groupHeader("Creative"));
+        tray.addView(trayRow(new IconButton[]{
+                trayIcon(IconButton.Glyph.NOTE, "Lyric Council")}));
+
+        tray.addView(groupHeader("Social"));
+        tray.addView(trayRow(new IconButton[]{
+                trayIcon(IconButton.Glyph.PEOPLE, "Friends"),
+                trayIcon(IconButton.Glyph.MIC, "Voice & Devices")}));
+
+        tray.addView(groupHeader("System"));
+        tray.addView(trayRow(new IconButton[]{
+                trayIcon(IconButton.Glyph.SHIELD, "Admin")}));
+
+        return tray;
+    }
+
+    private TextView groupHeader(String text) {
+        TextView t = label(text.toUpperCase(), 9, "#5b6b7d");
+        t.setPadding(dp(2), dp(6), 0, dp(2));
+        return t;
+    }
+
+    private LinearLayout trayRow(IconButton[] buttons) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        for (IconButton b : buttons) {
+            LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(dp(36), dp(36));
+            p.setMargins(dp(3), dp(2), dp(3), dp(2));
+            row.addView(b, p);
+        }
+        return row;
+    }
+
+    /**
+     * Panel buttons stay honest about scope: these surfaces live in the desktop
+     * workspace, so tapping one says where to go rather than opening an empty
+     * shell on the phone.
+     */
+    private IconButton trayIcon(IconButton.Glyph g, String name) {
+        IconButton b = icon(g, name, 18);
+        b.setOnClickListener(v -> setToast(name + " is a desktop surface. Open the XORA workspace on the PC."));
+        return b;
+    }
+
+    private void togglePanelTray() {
+        panelTray.setVisibility(panelTray.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE);
+        panelsBtn.setTint(panelTray.getVisibility() == View.VISIBLE
+                ? IconButton.Tint.ACTIVE : IconButton.Tint.NORMAL);
     }
 
     private GradientDrawable card(String hex) {
@@ -242,20 +509,19 @@ public class MainActivity extends Activity {
         IconButton b = new IconButton(this);
         b.setGlyph(g);
         b.setLabel(label);
-        b.setTint(IconButton.Tint.MUTED);
+        b.setTint(IconButton.Tint.NORMAL);
         b.setLayoutParams(new LinearLayout.LayoutParams(dp(sizeDp * 2), dp(sizeDp * 2)));
         return b;
     }
 
-    private LinearLayout.LayoutParams cell() {
-        LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(dp(76), dp(76));
-        p.setMargins(dp(8), dp(8), dp(8), dp(8));
-        return p;
-    }
-
     private void setPaired(boolean paired) {
         pairCard.setVisibility(paired ? View.GONE : View.VISIBLE);
-        dash.setVisibility(paired ? View.VISIBLE : View.GONE);
+        // The Orb is always visible: it is the app, and it doubles as the status
+        // indicator. Only the controls and the tray depend on pairing.
+        dock.setVisibility(paired ? View.VISIBLE : View.GONE);
+        if (!paired) {
+            panelTray.setVisibility(View.GONE);
+        }
     }
 
     /**
@@ -279,7 +545,6 @@ public class MainActivity extends Activity {
 
     private void showPairing() {
         setPaired(false);
-        orb.setState(OrbView.State.IDLE);
         statusView.setText("Not paired. Add your XORA host, paste the code, and pair.");
         leaseView.setText("");
     }
@@ -289,7 +554,6 @@ public class MainActivity extends Activity {
         String base = XoraClient.baseUrl(p.getString(KEY_HOST, DEFAULT_HOST));
         client = new XoraClient(base, p.getString(KEY_TOKEN, null),
                 p.getString(KEY_DEVICE_ID, null), io);
-        orb.setState(OrbView.State.PENDING);
         statusView.setText("Paired. Checking in...");
 
         micBtn.setOnClickListener(v -> toggleMic());
@@ -338,7 +602,6 @@ public class MainActivity extends Activity {
                 main.post(() -> renderLease(status, iAmOwner, iAmTarget));
             } catch (Exception e) {
                 main.post(() -> {
-                    orb.setState(OrbView.State.ERROR);
                     statusView.setText("Cannot reach XORA: " + e.getMessage());
                 });
             }
@@ -350,27 +613,22 @@ public class MainActivity extends Activity {
             case "awaiting_ack":
                 if (iAmTarget) {
                     // A transfer is addressed to this phone: offer the handoff.
-                    orb.setState(OrbView.State.PENDING);
-                    leaseView.setText("Audio handoff offered. Tap the hand icon to take it.");
+                                leaseView.setText("Audio handoff offered. Tap the hand icon to take it.");
                     handoffBtn.setGlyph(IconButton.Glyph.HANDOFF);
                     handoffBtn.setTint(IconButton.Tint.PENDING);
                     handoffBtn.setLabel("Accept audio handoff");
                     handoffBtn.setOnClickListener(v -> ackHandoff());
                 } else if (iAmOwner) {
-                    orb.setState(OrbView.State.PENDING);
-                    leaseView.setText("Handing audio to another device. Waiting for it to accept.");
+                                leaseView.setText("Handing audio to another device. Waiting for it to accept.");
                 } else {
-                    orb.setState(OrbView.State.LIVE);
-                    leaseView.setText("Another device is handing off audio.");
+                            leaseView.setText("Another device is handing off audio.");
                 }
                 break;
             case "owned":
-                orb.setState(OrbView.State.LIVE);
-                leaseView.setText(iAmOwner ? "This phone owns the audio lease." : "Another device owns the audio lease.");
+                    leaseView.setText(iAmOwner ? "This phone owns the audio lease." : "Another device owns the audio lease.");
                 break;
             default:
-                orb.setState(OrbView.State.IDLE);
-                leaseView.setText(iAmOwner ? "Idle, but this phone still holds the lease."
+                        leaseView.setText(iAmOwner ? "Idle, but this phone still holds the lease."
                         : "No active audio lease.");
         }
         // Release only makes sense while this device holds it.
@@ -428,8 +686,7 @@ public class MainActivity extends Activity {
                 int cursor = getSharedPreferences(PREFS, MODE_PRIVATE).getInt(KEY_CURSOR, 0);
                 JSONObject r = client.claimAudio(MainActivity.this, cursor);
                 main.post(() -> {
-                    orb.setState(OrbView.State.LIVE);
-                    setToast("This phone owns audio. Resume after cursor "
+                            setToast("This phone owns audio. Resume after cursor "
                             + r.optInt("resume_after", cursor) + ".");
                     pollLease();
                 });
@@ -448,8 +705,7 @@ public class MainActivity extends Activity {
             try {
                 client.releaseAudio(MainActivity.this);
                 main.post(() -> {
-                    orb.setState(OrbView.State.IDLE);
-                    handoffBtn.setGlyph(IconButton.Glyph.HANDOFF);
+                                handoffBtn.setGlyph(IconButton.Glyph.HANDOFF);
                     handoffBtn.setTint(IconButton.Tint.NORMAL);
                     handoffBtn.setLabel("Hand off audio");
                     handoffBtn.setOnClickListener(v -> requestHandoff());
@@ -547,7 +803,6 @@ public class MainActivity extends Activity {
             recorder.prepare();
             recorder.start();
             micOn = true;
-            orb.setState(OrbView.State.LIVE);
             micBtn.setGlyph(IconButton.Glyph.MIC);
             micBtn.setTint(IconButton.Tint.ACTIVE);
             micBtn.setLabel("Microphone on, tap to stop");
@@ -589,7 +844,6 @@ public class MainActivity extends Activity {
             return;
         }
         pairButton.setEnabled(false);
-        orb.setState(OrbView.State.PENDING);
         statusView.setText("Pairing...");
         final String base = XoraClient.baseUrl(host);
         io.execute(() -> {
@@ -611,7 +865,6 @@ public class MainActivity extends Activity {
                 });
             } catch (Exception e) {
                 main.post(() -> {
-                    orb.setState(OrbView.State.ERROR);
                     statusView.setText("Pairing failed: " + e.getMessage());
                     pairButton.setEnabled(true);
                 });

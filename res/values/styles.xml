@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        The dashboard is orb-first: a full-bleed canvas with a floating dock and
+        no chrome at all. This theme exists solely to guarantee that.
+
+        Without it the activity inherits the platform default, which carries an
+        ActionBar. That is what was drawing the "XORA Companion" title strip over
+        the Orb, and it is why the title would not go away no matter what the
+        layout code did. Parent is Theme.Material.NoActionBar rather than
+        AppCompat: the app uses plain android.app.Activity and has no AppCompat
+        dependency, and a mismatched parent throws at inflate time.
+
+        windowBackground matches the FrameLayout background in buildUi() so the
+        first frame after launch is the same near-black, with no white flash
+        while the Orb starts animating.
+    -->
+    <style name="XoraTheme" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/xora_bg</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+    </style>
+</resources>

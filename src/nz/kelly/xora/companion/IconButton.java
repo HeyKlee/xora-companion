@@ -21,7 +21,15 @@ import android.view.View;
  */
 public class IconButton extends View {
 
-    public enum Glyph { MIC, MIC_OFF, HANDOFF, HANDOFF_DONE, SYNC, CHAT, POWER, LOCK, HAND, CLOSE }
+    /**
+     * Glyphs. The first block is the control vocabulary; the second mirrors the
+     * panel icons in the unified shell's `projects` array, so a dock button and
+     * its desktop counterpart read the same way.
+     */
+    public enum Glyph {
+        MIC, MIC_OFF, HANDOFF, HANDOFF_DONE, SYNC, CHAT, POWER, LOCK, HAND, CLOSE,
+        CHART, BOOK, SPARK, SHIELD, NOTE, COIN, GRID, TERMINAL, PEOPLE, PANELS, CHEVRON
+    }
 
     private static final int BG = Color.parseColor("#111b28");
     private static final int RING = Color.parseColor("#61e8ff");
@@ -257,6 +265,140 @@ public class IconButton extends View {
             case CLOSE: {
                 canvas.drawLine(cx - s * 0.6f, cy - s * 0.6f, cx + s * 0.6f, cy + s * 0.6f, stroke);
                 canvas.drawLine(cx + s * 0.6f, cy - s * 0.6f, cx - s * 0.6f, cy + s * 0.6f, stroke);
+                break;
+            }
+            case CHART: {
+                // MultiHedge: a rising line over an axis.
+                canvas.drawLine(cx - s * 0.9f, cy + s * 0.8f, cx - s * 0.9f, cy - s * 0.8f, stroke);
+                canvas.drawLine(cx - s * 0.9f, cy + s * 0.8f, cx + s * 0.92f, cy + s * 0.8f, stroke);
+                path.reset();
+                path.moveTo(cx - s * 0.66f, cy + s * 0.42f);
+                path.lineTo(cx - s * 0.16f, cy - s * 0.14f);
+                path.lineTo(cx + s * 0.2f, cy + s * 0.16f);
+                path.lineTo(cx + s * 0.78f, cy - s * 0.6f);
+                canvas.drawPath(path, stroke);
+                break;
+            }
+            case BOOK: {
+                // Knowledge: an open book, two pages.
+                path.moveTo(cx - s * 0.9f, cy - s * 0.62f);
+                path.lineTo(cx - s * 0.06f, cy - s * 0.4f);
+                path.lineTo(cx - s * 0.06f, cy + s * 0.72f);
+                path.lineTo(cx - s * 0.9f, cy + s * 0.5f);
+                path.close();
+                canvas.drawPath(path, stroke);
+                path.reset();
+                path.moveTo(cx + s * 0.9f, cy - s * 0.62f);
+                path.lineTo(cx + s * 0.06f, cy - s * 0.4f);
+                path.lineTo(cx + s * 0.06f, cy + s * 0.72f);
+                path.lineTo(cx + s * 0.9f, cy + s * 0.5f);
+                path.close();
+                canvas.drawPath(path, stroke);
+                break;
+            }
+            case SPARK: {
+                // Skills: a four-point star.
+                path.moveTo(cx, cy - s * 0.96f);
+                path.quadTo(cx + s * 0.2f, cy - s * 0.2f, cx + s * 0.96f, cy);
+                path.quadTo(cx + s * 0.2f, cy + s * 0.2f, cx, cy + s * 0.96f);
+                path.quadTo(cx - s * 0.2f, cy + s * 0.2f, cx - s * 0.96f, cy);
+                path.quadTo(cx - s * 0.2f, cy - s * 0.2f, cx, cy - s * 0.96f);
+                canvas.drawPath(path, glyph);
+                break;
+            }
+            case SHIELD: {
+                // Admin: a shield outline with a centre bar.
+                path.moveTo(cx, cy - s * 0.9f);
+                path.lineTo(cx + s * 0.76f, cy - s * 0.56f);
+                path.lineTo(cx + s * 0.76f, cy + s * 0.18f);
+                path.quadTo(cx + s * 0.76f, cy + s * 0.76f, cx, cy + s * 0.94f);
+                path.quadTo(cx - s * 0.76f, cy + s * 0.76f, cx - s * 0.76f, cy + s * 0.18f);
+                path.lineTo(cx - s * 0.76f, cy - s * 0.56f);
+                path.close();
+                canvas.drawPath(path, stroke);
+                canvas.drawLine(cx, cy - s * 0.5f, cx, cy + s * 0.42f, stroke);
+                break;
+            }
+            case NOTE: {
+                // Lyric Council: a page of writing.
+                r.set(cx - s * 0.68f, cy - s * 0.9f, cx + s * 0.68f, cy + s * 0.9f);
+                path.addRoundRect(r, s * 0.18f, s * 0.18f, Path.Direction.CW);
+                canvas.drawPath(path, stroke);
+                for (int i = 0; i < 3; i++) {
+                    float y = cy - s * 0.42f + i * s * 0.4f;
+                    canvas.drawLine(cx - s * 0.36f, y, cx + s * 0.36f, y, stroke);
+                }
+                break;
+            }
+            case COIN: {
+                // Finance: a coin with a currency stroke.
+                canvas.drawCircle(cx, cy, s * 0.88f, stroke);
+                canvas.drawLine(cx, cy - s * 0.5f, cx, cy + s * 0.5f, stroke);
+                path.reset();
+                path.moveTo(cx - s * 0.3f, cy - s * 0.28f);
+                path.quadTo(cx, cy - s * 0.6f, cx + s * 0.3f, cy - s * 0.24f);
+                path.quadTo(cx, cy - s * 0.42f, cx - s * 0.3f, cy - s * 0.28f);
+                canvas.drawPath(path, stroke);
+                path.reset();
+                path.moveTo(cx - s * 0.3f, cy + s * 0.24f);
+                path.quadTo(cx, cy + s * 0.56f, cx + s * 0.3f, cy + s * 0.2f);
+                path.quadTo(cx, cy + s * 0.38f, cx - s * 0.3f, cy + s * 0.24f);
+                canvas.drawPath(path, stroke);
+                break;
+            }
+            case GRID: {
+                // Projects: a four-cell registry grid.
+                float g = s * 0.86f, q = s * 0.2f;
+                for (int ix = 0; ix < 2; ix++) {
+                    for (int iy = 0; iy < 2; iy++) {
+                        float x0 = cx - g + ix * (g - q / 2f + s * 0.14f);
+                        float y0 = cy - g + iy * (g - q / 2f + s * 0.14f);
+                        r.set(x0, y0, x0 + g - q, y0 + g - q);
+                        path.addRoundRect(r, s * 0.12f, s * 0.12f, Path.Direction.CW);
+                        canvas.drawPath(path, stroke);
+                        path.reset();
+                    }
+                }
+                break;
+            }
+            case TERMINAL: {
+                // Hermes: a prompt chevron and a caret.
+                path.moveTo(cx - s * 0.82f, cy - s * 0.5f);
+                path.lineTo(cx - s * 0.16f, cy);
+                path.lineTo(cx - s * 0.82f, cy + s * 0.5f);
+                canvas.drawPath(path, stroke);
+                canvas.drawLine(cx + s * 0.02f, cy + s * 0.56f, cx + s * 0.78f, cy + s * 0.56f, stroke);
+                break;
+            }
+            case PEOPLE: {
+                // Friends: two heads and shoulders.
+                canvas.drawCircle(cx - s * 0.36f, cy - s * 0.4f, s * 0.3f, stroke);
+                r.set(cx - s * 0.92f, cy + s * 0.02f, cx + s * 0.2f, cy + s * 0.9f);
+                path.addArc(r, 180f, 180f);
+                canvas.drawPath(path, stroke);
+                canvas.drawCircle(cx + s * 0.46f, cy - s * 0.5f, s * 0.24f, stroke);
+                r.set(cx - s * 0.06f, cy - s * 0.2f, cx + s * 0.98f, cy + s * 0.9f);
+                path.addArc(r, 180f, 180f);
+                canvas.drawPath(path, stroke);
+                break;
+            }
+            case PANELS: {
+                // Group container: a bracket set, for "more panels".
+                canvas.drawLine(cx - s * 0.72f, cy - s * 0.86f, cx - s * 0.94f, cy - s * 0.86f, stroke);
+                canvas.drawLine(cx - s * 0.94f, cy - s * 0.86f, cx - s * 0.94f, cy + s * 0.86f, stroke);
+                canvas.drawLine(cx - s * 0.94f, cy + s * 0.86f, cx - s * 0.72f, cy + s * 0.86f, stroke);
+                canvas.drawLine(cx + s * 0.72f, cy - s * 0.86f, cx + s * 0.94f, cy - s * 0.86f, stroke);
+                canvas.drawLine(cx + s * 0.94f, cy - s * 0.86f, cx + s * 0.94f, cy + s * 0.86f, stroke);
+                canvas.drawLine(cx + s * 0.94f, cy + s * 0.86f, cx + s * 0.72f, cy + s * 0.86f, stroke);
+                canvas.drawCircle(cx, cy, s * 0.34f, glyph);
+                break;
+            }
+            case CHEVRON: {
+                // Disclosure indicator: points up when collapsed, down when open.
+                path.moveTo(cx - s * 0.6f, cy + s * 0.22f);
+                path.lineTo(cx, cy - s * 0.28f);
+                path.lineTo(cx + s * 0.6f, cy + s * 0.22f);
+                canvas.drawPath(path, stroke);
                 break;
             }
             default:
