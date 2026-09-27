@@ -86,6 +86,12 @@ public class MainActivity extends Activity {
     // dashboard surface: one floating dock plus a grouped panel tray
     private LinearLayout dock;
     private LinearLayout panelTray;
+    /**
+     * Panel surface. Loads the real workspace shell and authenticates with the
+     * device token, so panels are genuinely available on the phone. It overlays
+     * the Orb rather than replacing it, so the Orb stays the app's identity.
+     */
+    private WebView panelWeb;
     private LinearLayout centerColumn;
     private IconButton panelsBtn;
     private IconButton micBtn;
@@ -282,6 +288,32 @@ public class MainActivity extends Activity {
         FrameLayout.LayoutParams orbLp = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
         frame.addView(orbWeb, orbLp);
+        // The panel surface sits over the Orb and stays hidden until a panel is
+        // opened. Same hardening as the Orb: opaque background so the shell's
+        // own panels composite correctly, and navigation pinned to the host.
+        panelWeb = new WebView(this);
+        panelWeb.setLayerType(View.LAYER_TYPE_HARDWARE, null);
+        panelWeb.setBackgroundColor(Color.parseColor("#070c14"));
+        panelWeb.setVisibility(View.GONE);
+        panelWeb.setContentDescription("XORA panels. Swipe from the left edge to go back to the Orb.");
+        WebSettings ps = panelWeb.getSettings();
+        ps.setJavaScriptEnabled(true);
+        ps.setDomStorageEnabled(true);
+        ps.setMediaPlaybackRequiresUserGesture(true);
+        ps.setUseWideViewPort(false);
+        ps.setLoadWithOverviewMode(false);
+        ps.setSupportZoom(false);
+        ps.setBuiltInZoomControls(false);
+        ps.setDisplayZoomControls(false);
+        panelWeb.setWebViewClient(new WebViewClient() {
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, String url) {
+                return true;
+            }
+        });
+        FrameLayout.LayoutParams panelLp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
+        frame.addView(panelWeb, panelLp);
         // The Orb renders from the paired host's /static. Until it is paired
         // there is no origin to load, so the WebView stays empty and the pair
         // card is all the user sees.
@@ -359,18 +391,20 @@ public class MainActivity extends Activity {
         dock.setGravity(Gravity.CENTER);
         dock.setBackground(dockBackground());
         dock.setPadding(dp(6), dp(6), dp(6), dp(6));
-        dock.setElevation(dp(12));
+        // Above the panel overlay's elevation, so the dock stays reachable while
+        // a panel is open: the user must always be able to get back to the Orb.
+        dock.setElevation(dp(20));
 
         panelsBtn = icon(IconButton.Glyph.PANELS, "Panels", 15);
-        panelsBtn.setOnClickListener(v -> togglePanelTray());
+        panelsBtn.setOnClickListener(v -> { closePanelOverlay(); togglePanelTray(); });
         micBtn = icon(IconButton.Glyph.MIC_OFF, "Microphone", 15);
         micBtn.setOnClickListener(v -> toggleMic());
         handoffBtn = icon(IconButton.Glyph.HANDOFF, "Hand off audio", 15);
         handoffBtn.setOnClickListener(v -> requestHandoff());
         chatBtn = icon(IconButton.Glyph.CHAT, "Chat", 15);
-        chatBtn.setOnClickListener(v -> setToast("Chat is a desktop surface. Open the XORA workspace on the PC."));
+        chatBtn.setOnClickListener(v -> openPanel("friends/overview"));
         friendsBtn = icon(IconButton.Glyph.PEOPLE, "Friends", 15);
-        friendsBtn.setOnClickListener(v -> setToast("Friends is a desktop surface. Open the XORA workspace on the PC."));
+        friendsBtn.setOnClickListener(v -> openPanel("friends/overview"));
         syncBtn = icon(IconButton.Glyph.SYNC, "Sync transcript", 15);
         syncBtn.setOnClickListener(v -> syncTranscript());
         logBtn = icon(IconButton.Glyph.NOTE, "Transcript entries", 15);
@@ -429,7 +463,7 @@ public class MainActivity extends Activity {
         tray.setVisibility(View.GONE);
         tray.setBackground(dockBackground());
         tray.setPadding(dp(12), dp(10), dp(12), dp(12));
-        tray.setElevation(dp(11));
+        tray.setElevation(dp(19));
 
         tray.addView(groupHeader("Trading"));
         tray.addView(trayRow(new IconButton[]{
@@ -481,14 +515,102 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * Panel buttons stay honest about scope: these surfaces live in the desktop
-     * workspace, so tapping one says where to go rather than opening an empty
-     * shell on the phone.
+     * Panel buttons open the real workspace surface on the phone.
+     *
+     * They used to toast "is a desktop surface" because every workspace call
+     * from a WebView failed: the phone holds a device token, not a session, and
+     * the workspace router only read a session cookie. Device-token auth is now
+     * in place, so these open for real instead of explaining themselves.
      */
     private IconButton trayIcon(IconButton.Glyph g, String name) {
         IconButton b = icon(g, name, 18);
-        b.setOnClickListener(v -> setToast(name + " is a desktop surface. Open the XORA workspace on the PC."));
+        b.setOnClickListener(v -> openPanel(PANEL_ROUTES.get(name)));
         return b;
+    }
+
+    /** Dock and tray label to the shell's project/view pair. */
+    private static final java.util.Map<String, String> PANEL_ROUTES = new java.util.HashMap<>();
+    static {
+        PANEL_ROUTES.put("MultiHedge", "multihedge/trading");
+        PANEL_ROUTES.put("Finance", "finance/overview");
+        PANEL_ROUTES.put("Knowledge", "knowledge/knowledge");
+        PANEL_ROUTES.put("Skills", "skills/overview");
+        PANEL_ROUTES.put("Hermes", "hermes/overview");
+        PANEL_ROUTES.put("Projects", "projects/registry");
+        PANEL_ROUTES.put("Lyric Council", "lyric-council/drafts");
+        PANEL_ROUTES.put("Friends", "friends/overview");
+        PANEL_ROUTES.put("Voice & Devices", "voice/overview");
+        PANEL_ROUTES.put("Admin", "admin/overview");
+    }
+
+    /**
+     * Open one panel in the overlay WebView.
+     *
+     * The shell is served from the paired host and reads ?panel=PROJECT/VIEW on
+     * load, so a single deep link is enough. The device token is injected into
+     * the page before it runs: the shell has no cookie jar here, and it sends
+     * that token as a Bearer credential on every API call.
+     */
+    private void openPanel(String route) {
+        if (route == null) {
+            setToast("That panel is unavailable");
+            return;
+        }
+        SharedPreferences p = getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        String token = p.getString(KEY_TOKEN, null);
+        if (token == null) {
+            setToast("Pair this device first");
+            return;
+        }
+        final String base = XoraClient.baseUrl(p.getString(KEY_HOST, DEFAULT_HOST));
+        if (panelWeb == null) {
+            return;
+        }
+        panelTray.setVisibility(View.GONE);
+        panelWeb.setVisibility(View.VISIBLE);
+        panelWeb.bringToFront();
+        final String url = base + "/?panel=" + route;
+        // The token must exist BEFORE the shell's boot() runs, so seed
+        // sessionStorage on a same-origin blank page first, then navigate. A
+        // javascript: URL afterwards arrives too late: boot() has already asked
+        // /auth/status with no credential and would bounce to the login form,
+        // which a phone has no way to submit. sessionStorage is same-origin, so
+        // the value survives the navigation to the shell.
+        panelWeb.loadDataWithBaseURL(base,
+                "<!doctype html><meta charset=utf-8><script>try{sessionStorage.setItem('xora_device_token',"
+                        + jsonString(token) + ")}catch(e){}</script>",
+                "text/html", "UTF-8", null);
+        panelWeb.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                panelWeb.loadUrl(url);
+            }
+        }, 150);
+    }
+
+    @Override
+    public void onBackPressed() {
+        // Back closes the panel overlay and returns to the Orb, rather than
+        // dropping the user out of the app with a panel still open.
+        if (panelWeb != null && panelWeb.getVisibility() == View.VISIBLE) {
+            closePanelOverlay();
+            return;
+        }
+        super.onBackPressed();
+    }
+
+    private void closePanelOverlay() {
+        if (panelWeb != null) {
+            panelWeb.setVisibility(View.GONE);
+        }
+        if (orbWeb != null) {
+            orbWeb.bringToFront();
+        }
+    }
+
+    /** JSON-encode a string for safe interpolation into a javascript: URL. */
+    private static String jsonString(String s) {
+        return "\"" + s.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
     }
 
     private void togglePanelTray() {
